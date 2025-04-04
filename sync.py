@@ -3,26 +3,30 @@ import sys
 import boto3
 import requests
 
-# --- Hardcoded Configuration ---
+# --- Load Configuration ---
 GITHUB_REPO_OWNER = "abulhasan18"
 GITHUB_REPO_NAME = "github-sync-s3"
 GITHUB_BRANCH = "main"
 S3_BUCKET = "github-sync-s3"
-GITHUB_TOKEN = "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"
+
+# Retrieve GitHub Token from environment variable
+GITHUB_TOKEN = os.getenv("TOKEN_SECRET")
+
+if not GITHUB_TOKEN:
+    print("❌ Error: GitHub token is missing. Make sure you have set TOKEN_SECRET in GitHub secrets or environment variables.")
+    sys.exit(1)
 
 # Construct GitHub API URL to get the repository tree recursively
 GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/git/trees/{GITHUB_BRANCH}?recursive=1"
 headers = {"Authorization": f"Bearer {GITHUB_TOKEN}"}
 response = requests.get(GITHUB_API_URL, headers=headers)
 
-
-
-
 if response.status_code != 200:
     print(f"❌ Failed to fetch GitHub file list: {response.text}")
     sys.exit(1)
 
 data = response.json()
+
 # Extract the set of file paths (only blobs) from GitHub repository
 github_files = {item["path"] for item in data.get("tree", []) if item["type"] == "blob"}
 
@@ -53,7 +57,6 @@ for file_path in s3_files - github_files:
     s3_client.delete_object(Bucket=S3_BUCKET, Key=file_path)
 
 print("✅ Sync Complete!")
-
 
 
 # github token

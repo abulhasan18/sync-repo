@@ -10,11 +10,16 @@ GITHUB_BRANCH = "main"
 S3_BUCKET = "github-sync-s3"
 
 # Retrieve GitHub Token from environment variable
-GITHUB_TOKEN = os.getenv("TOKEN_SECRET")
 
-if not GITHUB_TOKEN:
+
+github_token = os.getenv("GITHUB_TOKEN")
+
+if not github_token:
     print("❌ Error: GitHub token is missing. Make sure you have set TOKEN_SECRET in GitHub secrets or environment variables.")
-    sys.exit(1)
+    exit(1)
+else:
+    print("✅ GitHub token is available in sync.py")
+
 
 # Construct GitHub API URL to get the repository tree recursively
 GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/git/trees/{GITHUB_BRANCH}?recursive=1"

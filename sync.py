@@ -5,7 +5,7 @@ import requests
 
 # --- Load Configuration ---
 GITHUB_REPO_OWNER = "abulhasan18"
-GITHUB_REPO_NAME = "github-sync-s3"
+GITHUB_REPO_NAME = "sync-s3"
 GITHUB_BRANCH = "main"
 S3_BUCKET = "github-sync-s3"
 

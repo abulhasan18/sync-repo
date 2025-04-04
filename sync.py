@@ -12,8 +12,11 @@ GITHUB_TOKEN = "ghp_B9352MICh8s2rqhcoi7aSTrt7qfebA0jM9d1"
 
 # Construct GitHub API URL to get the repository tree recursively
 GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/git/trees/{GITHUB_BRANCH}?recursive=1"
-headers = {"Authorization": f"token {GITHUB_TOKEN}"}
+headers = {"Authorization": f"Bearer {GITHUB_TOKEN}"}
 response = requests.get(GITHUB_API_URL, headers=headers)
+
+
+
 
 if response.status_code != 200:
     print(f"❌ Failed to fetch GitHub file list: {response.text}")

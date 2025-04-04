@@ -8,7 +8,7 @@ GITHUB_REPO_OWNER = "abulhasan18"
 GITHUB_REPO_NAME = "github-sync-s3"
 GITHUB_BRANCH = "main"
 S3_BUCKET = "github-sync-s3"
-GITHUB_TOKEN = "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"
+GITHUB_TOKEN = "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"
 
 # Construct GitHub API URL to get the repository tree recursively
 GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/git/trees/{GITHUB_BRANCH}?recursive=1"
@@ -54,3 +54,7 @@ for file_path in s3_files - github_files:
 
 print("✅ Sync Complete!")
 
+
+
+# github token
+# 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

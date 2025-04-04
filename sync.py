@@ -23,7 +23,7 @@ else:
 
 # Construct GitHub API URL to get the repository tree recursively
 GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/git/trees/{GITHUB_BRANCH}?recursive=1"
-headers = {"Authorization": f"Bearer {GITHUB_TOKEN}"}
+headers = {"Authorization": f"Bearer {github_token}"}
 response = requests.get(GITHUB_API_URL, headers=headers)
 
 if response.status_code != 200:

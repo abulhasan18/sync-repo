@@ -1,0 +1,239 @@
+properties([
+    pipelineTriggers([
+        githubPush()
+    ])
+])
+
+
+pipeline {
+    agent any
+
+    // Auto-trigger builds by polling SCM every 5 minutes
+    triggers {
+        pollSCM('H/1 * * * *')
+    }
+
+
+    environment {
+        AWS_REGION = 'us-east-1'
+        AWS_INSTANCE_TYPE = 't3.medium'
+        AWS_AMI_ID = 'ami-0f561d16f3799be82'
+        AWS_KEY_PAIR = 'new-key'
+        AWS_SECURITY_GROUP = 'sg-0ae3e582d81ef3fe2'
+        AWS_SUBNET_ID = 'subnet-038df5829e56112a1'
+        AWS_IAM_ROLE = 'JenkinsSlaveRole'
+        GITHUB_REPO = 'https://github.com/abulhasan18/sync-repo.git'
+        AWS_TAG = 'GitHub-S3-Sync'
+    }
+    
+    parameters {
+        string(name: 'GITHUB_TOKEN', defaultValue: '', description: 'GitHub Token from GitHub Secrets')
+    }
+    
+        stages {
+          
+        stage('Checkout') {
+            steps {
+                checkout([
+                    $class: 'GitSCM',
+                    branches: [[name: '*/main']],
+                    userRemoteConfigs: [[
+                        url: 'https://github.com/abulhasan18/s3-sync.git'
+                    ]],
+                    extensions: [
+                        [$class: 'WipeWorkspace'],
+                        [$class: 'CleanBeforeCheckout']
+                    ]
+                ])
+            }
+        }
+
+      
+    
+        stage('Prepare User Data') {
+            steps {
+                script {
+                    writeFile file: 'userdata.txt', text: """#!/bin/bash
+                    echo "Ensuring yum is not locked..."
+                    while sudo fuser /var/lib/rpm/* >/dev/null 2>&1; do
+                        echo "Waiting for yum lock to release..."
+                        sleep 5
+                    done
+                    
+                    sudo yum clean all
+                    sudo yum update -y
+
+                    echo "Installing dependencies..."
+                    until sudo yum install -y git git-lfs python3 python3-pip aws-cli; do
+                        echo "Retrying yum installation..."
+                        sleep 10
+                    done
+
+                    pip3 install --upgrade pip
+                    pip3 install boto3 requests 
+
+                    echo 'export PATH=$HOME/.local/bin:$PATH' >> ~/.bashrc
+                    source ~/.bashrc
+                    sudo systemctl enable sshd && sudo systemctl start sshd
+                    """
+                }
+            }
+        }
+
+        stage('Launch EC2 Jenkins Slave') {
+            steps {
+                script {
+                    echo "Launching EC2 instance for Jenkins Slave..."
+                    def instance_id = sh(
+                        script: """
+                        aws ec2 run-instances --region $AWS_REGION \
+                            --image-id $AWS_AMI_ID \
+                            --count 1 \
+                            --instance-type $AWS_INSTANCE_TYPE \
+                            --key-name $AWS_KEY_PAIR \
+                            --security-group-ids $AWS_SECURITY_GROUP \
+                            --subnet-id $AWS_SUBNET_ID \
+                            --iam-instance-profile Name=$AWS_IAM_ROLE \
+                            --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=$AWS_TAG}]' \
+                            --user-data file://userdata.txt \
+                            --query 'Instances[0].InstanceId' --output text
+                        """,
+                        returnStdout: true
+                    ).trim()
+
+                    if (!instance_id) {
+                        error "Failed to launch EC2 instance!"
+                    }
+
+                    echo "EC2 Instance ID: ${instance_id}"
+                    env.INSTANCE_ID = instance_id
+
+                    sleep 30 // Ensures the instance is initialized before checking its state
+                }
+            }
+        }
+
+        stage('Wait for EC2 to be Ready') {
+            steps {
+                script {
+                    echo "Waiting for EC2 instance to be in running state..."
+                    sh "aws ec2 wait instance-running --region $AWS_REGION --instance-ids $INSTANCE_ID"
+
+                    echo "Fetching Public IP..."
+                    def public_ip = sh(
+                        script: """
+                        aws ec2 describe-instances --region $AWS_REGION \
+                            --instance-ids $INSTANCE_ID \
+                            --query 'Reservations[0].Instances[0].PublicIpAddress' --output text
+                        """,
+                        returnStdout: true
+                    ).trim()
+
+                    if (!public_ip || public_ip == "None") {
+                        error "Failed to retrieve EC2 public IP!"
+                    }
+
+                    echo "EC2 Public IP: ${public_ip}"
+                    env.EC2_PUBLIC_IP = public_ip
+                }
+            }
+        }
+
+        stage('Execute Sync on EC2') {
+            steps {
+                script {
+                    echo "Cloning GitHub repo and executing sync.py on EC2..."
+
+                    withCredentials([
+                        file(credentialsId: 'pem-file', variable: 'PEM_FILE'),
+                        string(credentialsId: 'TOKEN_SECRET', variable: 'GITHUB_TOKEN')  // Securely fetch token
+                    ]) {
+                        sh '''
+chmod 400 $PEM_FILE
+ssh -o StrictHostKeyChecking=no -i $PEM_FILE ec2-user@$EC2_PUBLIC_IP "GITHUB_TOKEN=$GITHUB_TOKEN bash -s" <<EOF
+export PATH=$HOME/.local/bin:$PATH
+export GITHUB_TOKEN="$GITHUB_TOKEN"
+
+echo "✅ Ensuring yum is not locked..."
+while sudo fuser /var/lib/rpm/* >/dev/null 2>&1; do
+    echo "Waiting for yum lock to release..."
+    sleep 5
+done
+
+echo "✅ Checking Python installation..."
+which python3 || until sudo yum install -y python3; do
+    echo "Retrying yum..."
+    sleep 10
+done
+
+echo "✅ Checking Git installation..."
+which git || until sudo yum install -y git git-lfs; do
+    echo "Retrying yum..."
+    sleep 10
+done
+
+echo "✅ Cloning repository..."
+[ -d "sync-repo" ] || git clone https://github.com/abulhasan18/sync-repo.git sync-repo
+
+echo "✅ Changing to repo directory..."
+cd sync-repo || { echo "❌ Failed to cd into sync-repo"; exit 1; }
+
+echo "✅ Setting up Python virtual environment..."
+python3 -m venv venv
+source venv/bin/activate
+pip install --upgrade pip
+pip install boto3 requests
+
+echo "✅ Checking if GITHUB_TOKEN is passed..."
+if [ -z "$GITHUB_TOKEN" ]; then
+    echo "❌ ERROR: GITHUB_TOKEN is missing!"
+    exit 1
+else
+    echo "✅ GITHUB_TOKEN is set (masked for security)"
+fi
+
+echo "🔹 Debug: Environment Variables (GITHUB_TOKEN should be present)"
+printenv | grep GITHUB || echo "❌ ERROR: GITHUB_TOKEN not found in env"
+
+if [ -f sync.py ]; then
+    echo "🚀 Executing sync.py..."
+    GITHUB_TOKEN="$GITHUB_TOKEN" python3 sync.py || {
+        echo "❌ Sync script failed!"
+        exit 1
+    }
+else
+    echo "❌ ERROR: sync.py not found!"
+    exit 1
+fi
+EOF
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Terminate EC2 Instance') {
+            steps {
+                script {
+                    echo "Terminating EC2 instance..."
+                    sh "aws ec2 terminate-instances --region $AWS_REGION --instance-ids $INSTANCE_ID"
+                }
+            }
+        }
+        
+        
+    }
+    
+    post {
+        failure {
+            script {
+                echo "Sync failed. Terminating instance..."
+                sh "aws ec2 terminate-instances --region $AWS_REGION --instance-ids $INSTANCE_ID || true"
+            }
+        }
+        always {
+            echo "Jenkins Pipeline Completed."
+        }
+    }
+}
+

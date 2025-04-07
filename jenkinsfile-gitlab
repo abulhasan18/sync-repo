@@ -1,0 +1,213 @@
+properties([
+    pipelineTriggers([
+        gitlabPush()
+    ])
+])
+
+pipeline {
+    agent any
+
+    environment {
+        AWS_REGION = 'us-east-1'
+        AWS_INSTANCE_TYPE = 't3.medium'
+        AWS_AMI_ID = 'ami-0f561d16f3799be82'
+        AWS_KEY_PAIR = 'new-key'
+        AWS_SECURITY_GROUP = 'sg-0ae3e582d81ef3fe2'
+        AWS_SUBNET_ID = 'subnet-038df5829e56112a1'
+        AWS_IAM_ROLE = 'JenkinsSlaveRole'
+        GITLAB_REPO = 'https://gitlab.com/abulhasan18/s3-sync.git'
+        AWS_TAG = 'GitLab-S3-Sync'
+    }
+
+    parameters {
+        string(name: 'GITLAB_TOKEN', defaultValue: '', description: 'GitLab Personal Access Token')
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                git branch: 'main',
+                    url: "${env.GITLAB_REPO}",
+                    credentialsId: 'gitlab-credentials-id' // Make sure this credential exists in Jenkins
+            }
+        }
+
+        stage('Prepare User Data') {
+            steps {
+                script {
+                    writeFile file: 'userdata.txt', text: """#!/bin/bash
+                    echo "Ensuring yum is not locked..."
+                    while sudo fuser /var/lib/rpm/* >/dev/null 2>&1; do
+                        echo "Waiting for yum lock to release..."
+                        sleep 5
+                    done
+
+                    sudo yum clean all
+                    sudo yum update -y
+
+                    until sudo yum install -y git git-lfs python3 python3-pip aws-cli; do
+                        echo "Retrying yum installation..."
+                        sleep 10
+                    done
+
+                    pip3 install --upgrade pip
+                    pip3 install boto3 requests
+
+                    echo 'export PATH=\$HOME/.local/bin:\$PATH' >> ~/.bashrc
+                    source ~/.bashrc
+                    sudo systemctl enable sshd && sudo systemctl start sshd
+                    """
+                }
+            }
+        }
+
+        stage('Launch EC2 Jenkins Slave') {
+            steps {
+                script {
+                    def instance_id = sh(
+                        script: """
+                        aws ec2 run-instances --region $AWS_REGION \
+                            --image-id $AWS_AMI_ID \
+                            --count 1 \
+                            --instance-type $AWS_INSTANCE_TYPE \
+                            --key-name $AWS_KEY_PAIR \
+                            --security-group-ids $AWS_SECURITY_GROUP \
+                            --subnet-id $AWS_SUBNET_ID \
+                            --iam-instance-profile Name=$AWS_IAM_ROLE \
+                            --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=$AWS_TAG}]' \
+                            --user-data file://userdata.txt \
+                            --query 'Instances[0].InstanceId' --output text
+                        """,
+                        returnStdout: true
+                    ).trim()
+                    env.INSTANCE_ID = instance_id
+                    sleep 30
+                }
+            }
+        }
+
+        stage('Wait for EC2 to be Ready') {
+            steps {
+                script {
+                    sh "aws ec2 wait instance-running --region $AWS_REGION --instance-ids $INSTANCE_ID"
+                    def public_ip = sh(
+                        script: """
+                        aws ec2 describe-instances --region $AWS_REGION \
+                            --instance-ids $INSTANCE_ID \
+                            --query 'Reservations[0].Instances[0].PublicIpAddress' --output text
+                        """,
+                        returnStdout: true
+                    ).trim()
+                    env.EC2_PUBLIC_IP = public_ip
+                }
+            }
+        }
+
+        stage('Execute Sync Script on EC2') {
+            steps {
+                script {
+                    withCredentials([
+                        file(credentialsId: 'pem-file', variable: 'PEM_FILE'),
+                        string(credentialsId: 'GITLAB_TOKEN_SECRET', variable: 'GITLAB_TOKEN')
+                    ]) {
+                        sh '''
+chmod 400 $PEM_FILE
+ssh -o StrictHostKeyChecking=no -i $PEM_FILE ec2-user@$EC2_PUBLIC_IP "GITLAB_TOKEN=$GITLAB_TOKEN bash -s" << 'EOF'
+#!/bin/bash
+
+echo "✅ Installing dependencies..."
+sudo yum install -y python3 git || exit 1
+pip3 install --upgrade pip
+pip3 install boto3 requests
+
+echo "✅ Running sync.py inline..."
+
+python3 << 'EOPY'
+import os
+import sys
+import boto3
+import requests
+
+# --- Config ---
+GITLAB_REPO = "abulhasan18/s3-sync"
+GITLAB_BRANCH = "main"
+S3_BUCKET = "github-sync-s3"
+TOKEN = os.getenv("GITLAB_TOKEN")
+
+if not TOKEN:
+    print("❌ GitLab token not found.")
+    sys.exit(1)
+else:
+    print("✅ GitLab token found.")
+
+headers = {
+    "PRIVATE-TOKEN": TOKEN
+}
+
+# --- Get default branch tree SHA ---
+project = GITLAB_REPO.replace("/", "%2F")
+tree_url = f"https://gitlab.com/api/v4/projects/{project}/repository/tree?ref={GITLAB_BRANCH}&recursive=true&per_page=100"
+response = requests.get(tree_url, headers=headers)
+
+if response.status_code != 200:
+    print(f"❌ Error fetching tree: {response.status_code} - {response.text}")
+    sys.exit(1)
+
+files = [item["path"] for item in response.json() if item["type"] == "blob"]
+print(f"✅ Retrieved {len(files)} files from GitLab.")
+
+# --- S3 Sync ---
+s3 = boto3.client("s3")
+s3_files = set()
+paginator = s3.get_paginator("list_objects_v2")
+for page in paginator.paginate(Bucket=S3_BUCKET):
+    for obj in page.get("Contents", []):
+        s3_files.add(obj["Key"])
+
+# Upload new files
+for file_path in set(files) - s3_files:
+    raw_url = f"https://gitlab.com/{GITLAB_REPO}/-/raw/{GITLAB_BRANCH}/{file_path}"
+    r = requests.get(raw_url, headers=headers)
+    if r.status_code == 200:
+        s3.put_object(Bucket=S3_BUCKET, Key=file_path, Body=r.content)
+        print(f"📂 Uploaded: {file_path}")
+    else:
+        print(f"❌ Failed to fetch {file_path} - {r.status_code}")
+
+# Delete removed files
+for file_path in s3_files - set(files):
+    s3.delete_object(Bucket=S3_BUCKET, Key=file_path)
+    print(f"🗑️ Deleted: {file_path}")
+
+print("✅ Sync complete!")
+EOPY
+EOF
+'''
+                    }
+                }
+            }
+        }
+
+        stage('Terminate EC2 Instance') {
+            steps {
+                script {
+                    sh "aws ec2 terminate-instances --region $AWS_REGION --instance-ids $INSTANCE_ID"
+                }
+            }
+        }
+
+    }
+
+    post {
+        failure {
+            script {
+                echo "Pipeline failed. Cleaning up..."
+                sh "aws ec2 terminate-instances --region $AWS_REGION --instance-ids $INSTANCE_ID || true"
+            }
+        }
+        always {
+            echo "Pipeline finished."
+        }
+    }
+}

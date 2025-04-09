@@ -1,0 +1,123 @@
+pipeline {
+    agent {
+        label 'ec2-s3-sync-agent'  // <-- Replace with the label configured in EC2 plugin
+    }
+
+    environment {
+        AWS_REGION     = 'us-east-1'
+        GITLAB_REPO    = 'https://gitlab.com/abulhasan182002/s3-sync'
+        GITLAB_PROJECT = 'abulhasan182002/s3-sync'
+        GITLAB_BRANCH  = 'main'
+        S3_BUCKET      = 'github-sync-s3'
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                git branch: "${env.GITLAB_BRANCH}",
+                    url: "${env.GITLAB_REPO}",
+                    credentialsId: 'gitlab-token-1'
+            }
+        }
+
+        stage('Check for Artifacts Folder Changes') {
+            steps {
+                script {
+                    def changes = sh(
+                        script: "git diff --name-only HEAD~1 HEAD | grep '^Artifacts/' || true",
+                        returnStdout: true
+                    ).trim()
+
+                    if (changes == "") {
+                        echo "No changes in the Artifacts folder. Skipping pipeline."
+                        currentBuild.result = 'ABORTED'
+                        error("Stopping pipeline as no relevant changes found.")
+                    } else {
+                        echo "Changes detected in Artifacts folder:\n${changes}"
+                    }
+                }
+            }
+        }
+
+        stage('Install Dependencies & Sync') {
+            steps {
+                withCredentials([
+                    string(credentialsId: 'gitlab-token-1', variable: 'GITLAB_TOKEN')
+                ]) {
+                    sh '''
+                    echo "Installing required packages..."
+                    sudo yum install -y git git-lfs python3 python3-pip aws-cli || true
+
+                    sudo ln -sf /usr/bin/pip3 /usr/local/bin/pip3
+                    pip3 install --upgrade pip
+                    pip3 install boto3 requests
+
+                    echo "Writing sync script..."
+
+                    cat <<'EOF' > sync.py
+import os
+import sys
+import boto3
+import requests
+
+GITLAB_REPO = "abulhasan182002/s3-sync"
+GITLAB_BRANCH = "main"
+FOLDER_TO_SYNC = "Artifacts"
+S3_BUCKET = "github-sync-s3"
+
+TOKEN = os.getenv("GITLAB_TOKEN")
+if not TOKEN:
+    print("ERROR: Missing GitLab token (GITLAB_TOKEN).")
+    sys.exit(1)
+
+headers = {"PRIVATE-TOKEN": TOKEN}
+project = GITLAB_REPO.replace("/", "%2F")
+url = f"https://gitlab.com/api/v4/projects/{project}/repository/tree?ref={GITLAB_BRANCH}&recursive=true&per_page=100"
+
+try:
+    response = requests.get(url, headers=headers)
+    response.raise_for_status()
+    all_files = [item["path"] for item in response.json() if item["type"] == "blob"]
+    target_files = [f for f in all_files if f.startswith(FOLDER_TO_SYNC + "/")]
+    print(f"Found {len(target_files)} file(s) under '{FOLDER_TO_SYNC}/'.")
+except Exception as e:
+    print(f"ERROR: GitLab API request failed: {e}")
+    sys.exit(1)
+
+s3 = boto3.client("s3")
+s3_files = set()
+for page in s3.get_paginator("list_objects_v2").paginate(Bucket=S3_BUCKET):
+    s3_files.update(obj["Key"] for obj in page.get("Contents", []))
+
+for file in set(target_files) - s3_files:
+    raw_url = f"https://gitlab.com/{GITLAB_REPO}/-/raw/{GITLAB_BRANCH}/{file}"
+    r = requests.get(raw_url, headers=headers)
+    if r.ok:
+        s3.put_object(Bucket=S3_BUCKET, Key=file, Body=r.content)
+        print(f"Uploaded: {file}")
+    else:
+        print(f"ERROR: Failed to fetch {file} from GitLab. Status code: {r.status_code}")
+
+for file in s3_files - set(target_files):
+    if file.startswith(FOLDER_TO_SYNC + "/"):
+        s3.delete_object(Bucket=S3_BUCKET, Key=file)
+        print(f"Deleted: {file}")
+
+print("Sync process completed.")
+EOF
+
+                    echo "Executing sync script..."
+                    python3 sync.py
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            echo "Pipeline execution completed."
+        }
+    }
+}
